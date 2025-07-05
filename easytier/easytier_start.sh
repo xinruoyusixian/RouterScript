@@ -11,6 +11,7 @@
 
 
 # === 日志输出函数 ===
+LOG_TAG="easytier"
 log() {
     logger -t "$LOG_TAG" "$1"
 }
@@ -71,16 +72,16 @@ case "$ARCH" in
 esac
 
 EASYTIER_BIN="$EASYTIER_DIR/easytier-core"
-
+EASYTIER_CLI_BIN="$EASYTIER_DIR/easytier-cli"
 # ---------- 生成/读取 machine_id，并初始化 easytier.txt 默认节点 ----------
 if [ ! -f "$EASYTIER_TXT" ]; then
     MACHINE_ID=$(cat /dev/urandom | tr -dc 'a-f0-9' | head -c32)
     {
-        log "machine_id:$MACHINE_ID"
-        log "#若需要代理本地网络，在下面添加（仅一行生效）:"
-        log "#proxy:192.168.100.0/24 "
-        log "# 可添加更多节点，每行一个，例如："
-        log "node tcp://public.easytier.cn:11010"
+        echo "machine_id:$MACHINE_ID"
+        echo "#若需要代理本地网络，在下面添加（仅一行生效）:"
+        echo "#proxy:192.168.100.0/24 "
+        echo "# 可添加更多节点，每行一个，例如："
+        echo "node tcp://public.easytier.cn:11010"
         
 
     } > "$EASYTIER_TXT"
@@ -108,8 +109,8 @@ if [ -f "$EASYTIER_TXT" ]; then
     PROXY_LINE=$(grep '^proxy:' "$EASYTIER_TXT" | head -n1)
     if [ -n "$PROXY_LINE" ]; then
         # 去掉注释部分
-        PROXY_NET=$(log "$PROXY_LINE" | sed -e 's/^proxy://' -e 's/[[:space:]]*#.*$//')
-        PROXY_NET=$(log "$PROXY_NET" | tr -d ' ')
+        PROXY_NET=$(echo "$PROXY_LINE" | sed -e 's/^proxy://' -e 's/[[:space:]]*#.*$//')
+        PROXY_NET=$(echo "$PROXY_NET" | tr -d ' ')
     fi
 fi
 
@@ -120,7 +121,7 @@ else
 fi
 
 # ---------- Padavan方式开启网关转发 ----------
-log 1 > /proc/sys/net/ipv4/ip_forward
+echo 1 > /proc/sys/net/ipv4/ip_forward
 
 # ---------- 自动添加防火墙转发规则，避免重复 ----------
 if [ -n "$PROXY_NET" ]; then
@@ -176,14 +177,29 @@ if [ ! -x "$EASYTIER_BIN" ]; then
         rmdir "$ZIP_DIR"
     fi
     chmod +x easytier-core 2>/dev/null
+    chmod +x easytier-cli 2>/dev/null
     cd - > /dev/null
 fi
 
-CMD="$EASYTIER_BIN -d --network-name \"$NETWORK_NAME\" --network-secret \"$NETWORK_SECRET\" --hostname \"$USERNAME\" --machine-id \"$MACHINE_ID\" $PEER_PARAMS $PROXY_PARAM"
+CMD="$EASYTIER_BIN -d --network-name \"$NETWORK_NAME\" --network-secret \"$NETWORK_SECRET\" --hostname \"$USERNAME\" --machine-id \"$MACHINE_ID\" $PEER_PARAMS $PROXY_PARAM &"
 
-log "启动命令："
+echo $CMD
 log $CMD
-
 eval $CMD
+sleep 3
+# 获取 easytier-cli node 的输出
+$EASYTIER_CLI_BIN node
+output=$($EASYTIER_CLI_BIN node)
+# 提取信息
+VirtualIP=$(echo "$output" | awk -F'│' '/Virtual IP/ {gsub(/^[ \t]+|[ \t]+$/,"",$3); print $3}')
+Hostname=$(echo "$output" | awk -F'│' '/Hostname/ {gsub(/^[ \t]+|[ \t]+$/,"",$3); print $3}')
+PeerID=$(echo "$output" | awk -F'│' '/Peer ID/ {gsub(/^[ \t]+|[ \t]+$/,"",$3); print $3}')
+
+# 以 log 格式输出
+echo $output
+echo  "Virtual IP: $VirtualIP"
+log "Virtual IP: $VirtualIP"
+log "Hostname: $Hostname"
+log "Peer ID: $PeerID"
 
 exit $?

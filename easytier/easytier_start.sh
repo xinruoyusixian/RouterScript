@@ -10,6 +10,9 @@
 # 4. 注释与说明写入 easytier.txt
 
 
+# 架构选择mipsel|mips|amd64|arm64|arm
+ARCH="mipsel"
+USERNAME=""
 
 SCRIPT_PATH="$(
   cd "$(dirname "$0")"
@@ -26,33 +29,14 @@ log() {
     logger -t "$LOG_TAG" "$1"
 }
 
-
-
-USERNAME=""
-
 if [ $# -lt 2 ]; then
-    echo "用法: $0 <network-name> <network-secret> [arch]"
-    log "  [arch] 可选，留空时自动检测。可选值：mipsel mips amd64 arm64 arm"
+    echo "用法: $0 <network-name> <network-secret> "
     exit 1
 fi
 
 NETWORK_NAME="$1"
 NETWORK_SECRET="$2"
 
-# 自动检测架构，支持用户手动指定
-if [ -n "$3" ]; then
-    ARCH="$3"
-else
-    ARCH_RAW=$(uname -m)
-    case "$ARCH_RAW" in
-        x86_64)   ARCH="amd64" ;;
-        aarch64)  ARCH="arm64" ;;
-        armv7*|armv6*|armhf) ARCH="arm" ;;
-        mipsel)   ARCH="mipsel" ;;
-        mips)     ARCH="mips" ;;
-        *)        ARCH="mipsel" ;; # 默认
-    esac
-fi
 
 if [ -z "$USERNAME" ]; then
     USERNAME="$NETWORK_NAME"
@@ -181,10 +165,12 @@ if [ ! -x "$EASYTIER_BIN" ]; then
         exit 1
     fi
 
-    log "正在解压..."
+    log "正在解压到$ZIP_NAME..."
+    
     unzip -o "$ZIP_NAME"
     if [ -d "$ZIP_DIR" ]; then
         mv "$ZIP_DIR"/* ./
+        log "移动$ZIP_DIR..."
         rmdir "$ZIP_DIR"
     fi
     chmod +x easytier-core 2>/dev/null

@@ -10,6 +10,16 @@
 # 4. 注释与说明写入 easytier.txt
 
 
+
+SCRIPT_PATH="$(
+  cd "$(dirname "$0")"
+  pwd
+)/$(basename "$0")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+
+#echo "脚本绝对路径: $SCRIPT_PATH"
+$echo "脚本所在目录: $SCRIPT_DIR"
+
 # === 日志输出函数 ===
 LOG_TAG="easytier"
 log() {
@@ -49,7 +59,8 @@ if [ -z "$USERNAME" ]; then
 fi
 
 EASYTIER_DIR="/tmp/easytier"
-EASYTIER_TXT="./easytier.txt"
+EASYTIER_TXT="$SCRIPT_DIR/easytier.txt"
+echo $EASYTIER_TXT
 
 # 下载链接适配
 case "$ARCH" in

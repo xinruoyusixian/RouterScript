@@ -21,7 +21,7 @@ SCRIPT_PATH="$(
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
 #echo "脚本绝对路径: $SCRIPT_PATH"
-$echo "脚本所在目录: $SCRIPT_DIR"
+#echo "脚本所在目录: $SCRIPT_DIR"
 
 # === 日志输出函数 ===
 LOG_TAG="easytier"

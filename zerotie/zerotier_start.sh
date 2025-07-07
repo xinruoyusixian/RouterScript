@@ -1,12 +1,13 @@
+####ZEROTIER
 ZEROTIER_ONE="/opt/bin/zerotier-one"
-ZEROTIER_CLI="$ZEROTIER_CLI"
+ZEROTIER_CLI="/opt/bin/zerotier-cli"
 LOG_TAG="【Zerotier】"
 # === 日志输出函数 ===
 log() {
     logger -t "$LOG_TAG" "$1"
 }
 
-
+log "脚本启动"
 #环境判断
 evnCheck(){
 
@@ -51,6 +52,19 @@ start_zerotier_one() {
     fi
 }
 
+# === iptables 防火墙规则添加函数 ===
+add_iptables_rule() {
+ #log "防火墙规则添加"
+/bin/iptables -C INPUT -i "$ZT_INTERFACE" -j ACCEPT 2>/dev/null                  ||  /bin/iptables -A INPUT -i "$ZT_INTERFACE" -j ACCEPT
+# FORWARD -i
+/bin/iptables -C FORWARD -i "$ZT_INTERFACE" -j ACCEPT 2>/dev/null                ||  /bin/iptables -I FORWARD -i "$ZT_INTERFACE" -j ACCEPT
+# FORWARD -o
+/bin/iptables -C FORWARD -o "$ZT_INTERFACE" -j ACCEPT 2>/dev/null                ||  /bin/iptables -I FORWARD -o "$ZT_INTERFACE" -j ACCEPT
+# NAT MASQUERADE
+/bin/iptables -t nat -C POSTROUTING -o "$ZT_INTERFACE" -j MASQUERADE 2>/dev/null ||        /bin/iptables -t nat -I POSTROUTING -o "$ZT_INTERFACE" -j MASQUERADE
+}
+
+
 # === 加入 Zerotier 网络函数 ===
 join_network() {
     if ! $ZEROTIER_CLI listnetworks | grep -q "$ZT_NETWORK_ID"; then
@@ -92,60 +106,18 @@ get_zt_interface() {
         log "未检测到 Zerotier 虚拟网卡"
         return 1
     fi
-    log "检测到 Zerotier 虚拟网卡 $ZT_INTERFACE"
+      echo "检测到 Zerotier 虚拟网卡 $ZT_INTERFACE"
+      add_iptables_rule
     return 0
 }
-# === iptables 防火墙规则添加函数 ===
-add_iptables_rule() {
-    # $1: 表（可选，默认为filter），$2: 链，$3: 方向（-i/-o），$4: 网卡名，$5: 动作（如ACCEPT/MASQUERADE），$6: 插入方式（-A/-I，默认-A）
-    TABLE_OPT=""
-    if [ -n "$1" ] && [ "$1" != "filter" ]; then
-        TABLE_OPT="-t $1"
+
+
+check_args "$1"
+evnCheck
+start_zerotier_one
+join_network
+if wait_online; then
+   if get_zt_interface; then
+      add_iptables_rule
     fi
-    CHAIN="$2"
-    DIR="$3"
-    IFACE="$4"
-    ACTION="$5"
-    APPEND="${6:--A}"
-
-    if [ "$ACTION" = "MASQUERADE" ]; then
-        iptables $TABLE_OPT -C $CHAIN $DIR "$IFACE" -j MASQUERADE 2>/dev/null
-        EXIST=$?
-    else
-        iptables $TABLE_OPT -C $CHAIN $DIR "$IFACE" -j ACCEPT 2>/dev/null
-        EXIST=$?
-    fi
-
-    if [ $EXIST -ne 0 ]; then
-        iptables $TABLE_OPT $APPEND $CHAIN $DIR "$IFACE" -j "$ACTION"
-        log "已添加 $CHAIN $DIR $IFACE $ACTION 规则"
-    else
-        log "$CHAIN $DIR $IFACE $ACTION 规则已存在"
-    fi
-}
-
-# === 添加所有需要的防火墙规则函数 ===
-setup_firewall() {
-    add_iptables_rule filter INPUT -i "$ZT_INTERFACE" ACCEPT -A
-    add_iptables_rule filter FORWARD -i "$ZT_INTERFACE" ACCEPT -I
-    add_iptables_rule filter FORWARD -o "$ZT_INTERFACE" ACCEPT -I
-    add_iptables_rule nat POSTROUTING -o "$ZT_INTERFACE" MASQUERADE -I
-}
-
-# =========== 主循环函数 ===========
-mainloop() {
-    check_args "$1"
-    while true; do
-        evnCheck
-        start_zerotier_one
-        join_network
-        if wait_online; then
-            if get_zt_interface; then
-                setup_firewall
-            fi
-        fi
-        sleep 60
-    done
-}
-
-mainloop "$@"
+fi

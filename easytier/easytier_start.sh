@@ -13,7 +13,7 @@
 # 架构选择mipsel|mips|amd64|arm64|arm
 ARCH="mipsel"
 USERNAME=""
-
+PROXY_DEV="tun0"
 SCRIPT_PATH="$(
   cd "$(dirname "$0")"
   pwd
@@ -21,10 +21,10 @@ SCRIPT_PATH="$(
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
 #echo "脚本绝对路径: $SCRIPT_PATH"
-#echo "脚本所在目录: $SCRIPT_DIR"
+$echo "脚本所在目录: $SCRIPT_DIR"
 
 # === 日志输出函数 ===
-LOG_TAG="easytier"
+LOG_TAG="【easytier】"
 log() {
     logger -t "$LOG_TAG" "$1"
 }
@@ -120,37 +120,42 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
 
 # ---------- 自动添加防火墙转发规则，避免重复 ----------
 if [ -n "$PROXY_NET" ]; then
-    iptables -C FORWARD -s "$PROXY_NET" -j ACCEPT 2>/dev/null || iptables -A FORWARD -s "$PROXY_NET" -j ACCEPT
-    iptables -C FORWARD -d "$PROXY_NET" -j ACCEPT 2>/dev/null || iptables -A FORWARD -d "$PROXY_NET" -j ACCEPT
+    /bin/iptables  -C FORWARD -s "$PROXY_NET" -j ACCEPT 2>/dev/null ||  /bin/iptables  -A FORWARD -s "$PROXY_NET" -j ACCEPT
+    /bin/iptables  -C FORWARD -d "$PROXY_NET" -j ACCEPT 2>/dev/null ||  /bin/iptables  -A FORWARD -d "$PROXY_NET" -j ACCEPT
     log "已放行 $PROXY_NET 的FORWARD转发"
 fi
 
-# 检查并添加 INPUT 规则
-iptables -C INPUT -i tun0 -j ACCEPT 2>/dev/null
-if [ $? -ne 0 ]; then
-    iptables -A INPUT -i tun0 -j ACCEPT
-    log "已添加: iptables -A INPUT -i tun0 -j ACCEPT"
-else
-    log "规则已存在: iptables -A INPUT -i tun0 -j ACCEPT"
-fi
-
-# 检查并添加 FORWARD 规则
-iptables -C FORWARD -i tun0 -j ACCEPT 2>/dev/null
-if [ $? -ne 0 ]; then
-    iptables -A FORWARD -i tun0 -j ACCEPT
-    log "已添加: iptables -A FORWARD -i tun0 -j ACCEPT"
-else
-    log "规则已存在: iptables -A FORWARD -i tun0 -j ACCEPT"
-fi
+/bin/iptables -C INPUT -i "$PROXY_DEV" -j ACCEPT 2>/dev/null    ||  /bin/iptables -A INPUT -i "$PROXY_DEV" -j ACCEPT
+# FORWARD -i
+/bin/iptables -C FORWARD -i "$PROXY_DEV" -j ACCEPT 2>/dev/null  ||  /bin/iptables -I FORWARD -i "$PROXY_DEV" -j ACCEPT
+# FORWARD -o
+/bin/iptables -C FORWARD -o "$PROXY_DEV" -j ACCEPT 2>/dev/null  ||  /bin/iptables -I FORWARD -o "$PROXY_DEV" -j ACCEPT
+# NAT MASQUERADE
+/bin/iptables -t nat -C POSTROUTING -o "$PROXY_DEV" -j MASQUERADE 2>/dev/null ||        /bin/iptables -t nat -I POSTROUTING -o "$PROXY_DEV" -j MASQUERADE
 
 
-
-
+link_info(){
+  # 获取 easytier-cli node 的输出
+  $EASYTIER_CLI_BIN node
+  output=$($EASYTIER_CLI_BIN node)
+  # 提取信息
+  VirtualIP=$(echo "$output" | awk -F'│' '/Virtual IP/ {gsub(/^[ \t]+|[ \t]+$/,"",$3); print $3}')
+  Hostname=$(echo "$output" | awk -F'│' '/Hostname/ {gsub(/^[ \t]+|[ \t]+$/,"",$3); print $3}')
+  PeerID=$(echo "$output" | awk -F'│' '/Peer ID/ {gsub(/^[ \t]+|[ \t]+$/,"",$3); print $3}')
+  
+  # 以 log 格式输出
+  echo $output
+  echo  "Virtual IP: $VirtualIP"
+  log "Virtual IP: $VirtualIP"
+  log "Hostname: $Hostname"
+  log "Peer ID: $PeerID"
+}
 
 # ---------- 检查服务是否已运行 ----------
 if pidof easytier-core > /dev/null 2>&1; then
     log "EasyTier 服务已经运行。"
     echo "EasyTier 服务已经运行。"
+    link_info
     exit 0
 fi
 
@@ -184,19 +189,6 @@ echo $CMD
 log $CMD
 eval $CMD
 sleep 3
-# 获取 easytier-cli node 的输出
-$EASYTIER_CLI_BIN node
-output=$($EASYTIER_CLI_BIN node)
-# 提取信息
-VirtualIP=$(echo "$output" | awk -F'│' '/Virtual IP/ {gsub(/^[ \t]+|[ \t]+$/,"",$3); print $3}')
-Hostname=$(echo "$output" | awk -F'│' '/Hostname/ {gsub(/^[ \t]+|[ \t]+$/,"",$3); print $3}')
-PeerID=$(echo "$output" | awk -F'│' '/Peer ID/ {gsub(/^[ \t]+|[ \t]+$/,"",$3); print $3}')
-
-# 以 log 格式输出
-echo $output
-echo  "Virtual IP: $VirtualIP"
-log "Virtual IP: $VirtualIP"
-log "Hostname: $Hostname"
-log "Peer ID: $PeerID"
+link_info
 
 exit $?

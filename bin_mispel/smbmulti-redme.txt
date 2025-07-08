@@ -1,0 +1,8 @@
+先执行ps|grep mbd记录 smbd和nmbd的参数，后面要用
+
+1.路由器后台 -> 系统管理 -> 服务 -> 启用ttyd ->访问ttyd端口--> 登录ttyd 
+-> cd /tmp-> 执行 lrz -> 选择上传程序文件smbmulti ->执行 chmod 777 ./smbmulti
+2.软链接
+ln -s smbmulti smbd
+ln -s smbmulti nmbd
+3.->执行 ./smbd 参数

@@ -78,13 +78,12 @@ log() {
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     
     # 写入文件日志
-    echo "[$timestamp] $message" >> "$LOG_FILE"
+    #echo "[$timestamp] $message" >> "$LOG_FILE"
     
     # 写入系统日志
     logger -t "$SCRIPT_NAME" "$message" 2>/dev/null
-    
-    # 写入调试日志
-    echo "[$timestamp] $message" >> $DEBUG_LOG
+    # 显示调试日志
+    echo "[$timestamp] $message"
 }
 
 # 锁定函数

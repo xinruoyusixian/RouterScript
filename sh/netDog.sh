@@ -272,11 +272,17 @@ show_bond_status() {
         
         for slave in $slaves; do
             local slave_state="unknown"
+            local slave_type="有线"
+            
+            if is_wireless_interface "$slave"; then
+                slave_type="无线"
+            fi
+            
             if [ -f "/sys/class/net/$BOND_INTERFACE/bonding/slave_$slave/state" ]; then
                 slave_state=$(cat "/sys/class/net/$BOND_INTERFACE/bonding/slave_$slave/state" 2>/dev/null)
             fi
             local slave_link=$(ip link show "$slave" 2>/dev/null | grep -o "state [A-Z]*" | cut -d' ' -f2)
-            echo "  $slave: 状态=$slave_state, 链路=$slave_link"
+            echo "  $slave [$slave_type]: 状态=$slave_state, 链路=$slave_link"
         done
     fi
     
@@ -288,9 +294,27 @@ show_bond_status() {
     echo "网关: $bond_gateway"
     echo "基本状态: $(check_interface_basic "$BOND_INTERFACE" && echo '✓' || echo '✗')"
     echo "网络连通: $(check_connectivity "$BOND_INTERFACE" && echo '✓' || echo '✗')"
+    
+    # 显示警告信息
+    local has_wireless=false
+    for slave in $(cat "/sys/class/net/$BOND_INTERFACE/bonding/slaves" 2>/dev/null); do
+        if is_wireless_interface "$slave"; then
+            has_wireless=true
+            break
+        fi
+    done
+    
+    if [ "$has_wireless" = "true" ]; then
+        echo -e "\n--- 注意 ---"
+        echo "检测到无线接口参与链路聚合:"
+        echo "- 速度/双工警告是正常的"
+        echo "- 某些高级bonding功能可能受限"
+        echo "- 基本数据转发应该正常工作"
+    fi
 }
 
-# 创建链路聚合
+
+# 创建链路聚合（改进版本，处理无线接口）
 create_bond() {
     if is_bond_enabled; then
         log "链路聚合 $BOND_INTERFACE 已存在"
@@ -299,7 +323,6 @@ create_bond() {
     fi
     
     log "开始创建链路聚合 $BOND_INTERFACE"
-    debug_interfaces
     
     # 获取WAN和WWAN的实际设备名
     local wan_device=$(get_interface_device "$WAN_INTERFACE")
@@ -316,6 +339,13 @@ create_bond() {
     if [ "$wan_device" = "$wwan_device" ]; then
         log "错误: WAN 和 WWAN 使用相同设备，无法聚合"
         return 1
+    fi
+    
+    # 检查接口类型
+    local has_wireless=false
+    if is_wireless_interface "$wan_device" || is_wireless_interface "$wwan_device"; then
+        log "检测到无线接口，使用兼容模式"
+        has_wireless=true
     fi
     
     log "聚合设备: $wan_device + $wwan_device -> $BOND_INTERFACE"
@@ -335,7 +365,7 @@ create_bond() {
     if ! lsmod | grep -q bonding; then
         log "加载bonding模块..."
         modprobe bonding
-        sleep 1
+        sleep 2
     fi
     
     # 创建bond接口
@@ -350,6 +380,15 @@ create_bond() {
         echo "$BOND_FAIL_OVER_MAC" > "/sys/class/net/$BOND_INTERFACE/bonding/fail_over_mac"
     fi
     
+    # 对于无线接口，调整一些参数以减少警告
+    if [ "$has_wireless" = "true" ]; then
+        log "应用无线接口兼容设置..."
+        # 增加miimon时间，减少检测频率
+        if [ -f "/sys/class/net/$BOND_INTERFACE/bonding/miimon" ]; then
+            echo "250" > "/sys/class/net/$BOND_INTERFACE/bonding/miimon"
+        fi
+    fi
+    
     # 关闭原接口，避免地址冲突
     log "关闭原接口并清理IP地址..."
     ip link set "$wan_device" down
@@ -361,8 +400,13 @@ create_bond() {
     
     # 将接口加入bond
     log "将接口加入bond..."
-    ip link set "$wan_device" master "$BOND_INTERFACE"
-    ip link set "$wwan_device" master "$BOND_INTERFACE"
+    if ! ip link set "$wan_device" master "$BOND_INTERFACE"; then
+        log "警告: 将 $wan_device 加入bond失败"
+    fi
+    
+    if ! ip link set "$wwan_device" master "$BOND_INTERFACE"; then
+        log "警告: 将 $wwan_device 加入bond失败"
+    fi
     
     # 启用所有接口
     log "启用所有接口..."
@@ -373,20 +417,24 @@ create_bond() {
     # 使用DHCP获取地址
     log "通过DHCP获取 $BOND_INTERFACE 地址..."
     if command -v udhcpc >/dev/null 2>&1; then
-        udhcpc -i "$BOND_INTERFACE" -n -q -t 5 -T 3 >/dev/null 2>&1 &
-        local dhcp_pid=$!
-        sleep 3
+        # 后台运行DHCP，不等待太长时间
+        (udhcpc -i "$BOND_INTERFACE" -n -q -t 3 -T 2 >/dev/null 2>&1 &)
     else
         log "警告: udhcpc 不可用，无法自动获取IP"
     fi
     
-    sleep 3
+    sleep 5
     
     # 验证bond状态
-    debug_interfaces
-    
     if is_bond_enabled; then
         log "✓ 链路聚合创建成功"
+        
+        # 显示警告信息（如果有）
+        if [ "$has_wireless" = "true" ]; then
+            log "注意: 检测到无线接口，某些bonding功能可能受限"
+            log "      速度/双工警告是正常的，不影响基本使用"
+        fi
+        
         show_bond_status
         return 0
     else
@@ -394,7 +442,17 @@ create_bond() {
         return 1
     fi
 }
-
+# 检查是否为无线接口
+is_wireless_interface() {
+    local interface="$1"
+    if [ -d "/sys/class/net/$interface/wireless" ] || \
+       [ -d "/sys/class/net/$interface/phy80211" ] || \
+       echo "$interface" | grep -q -E "^(wlan|wlp|phy|ath|sta)"; then
+        return 0
+    else
+        return 1
+    fi
+}
 # 删除链路聚合
 remove_bond() {
     if ! is_bond_enabled; then
@@ -601,7 +659,8 @@ show_help() {
     echo "  WAN接口: $WAN_INTERFACE"
     echo "  WWAN接口: $WWAN_INTERFACE"
     echo "  Bond接口: $BOND_INTERFACE (mode=$BOND_MODE, miimon=$BOND_MIIMON)"
-    echo "  检测目标: $PING_TARGETS"
+    echo "  检测目标: $PING_TARGETS"    
+    echo "注意: 支持无线接口聚合，但某些功能可能受限"
 }
 
 # 测试功能
@@ -680,3 +739,4 @@ main() {
 
 # 执行主函数
 main "$@"
+

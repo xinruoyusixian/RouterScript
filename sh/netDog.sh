@@ -1,8 +1,9 @@
 #!/bin/sh
 
 # ==============================================
-# 智能网络切换脚本 - 修复版
+# 智能网络切换脚本 - 修复版 + 链路聚合功能
 # 修复命令找不到问题，增强兼容性
+# 支持链路聚合 bond0 (mode=4 LACP)
 # ==============================================
 
 # 设置完整的环境变量
@@ -17,6 +18,10 @@ cd /tmp
 # 基础配置
 WAN_INTERFACE="wan"
 WWAN_INTERFACE="wwan"
+BOND_INTERFACE="bond0"
+BOND_MODE="4"  # LACP模式
+BOND_MIIMON="100"
+BOND_FAIL_OVER_MAC="active"
 
 # 多ping目标提高可靠性
 PING_TARGETS="8.8.8.8 1.1.1.1 223.5.5.5"
@@ -65,10 +70,34 @@ log() {
     echo "[$timestamp] $message" >> "/var/log/${LOG_TAG}.log" 2>/dev/null
 }
 
+# 调试函数：显示所有网络接口
+debug_interfaces() {
+    log "=== 调试信息：网络接口状态 ==="
+    ip link show | grep -E "^[0-9]:" | while read line; do
+        log "接口: $line"
+    done
+    log "当前所有接口: $(ip link show | grep -E "^[0-9]:" | wc -l) 个"
+}
+
+# 检查是否启用了链路聚合
+is_bond_enabled() {
+    if [ -d "/sys/class/net/$BOND_INTERFACE" ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
 # 获取接口设备名 - 修复版本
 get_interface_device() {
     local interface="$1"
     local device=""
+    
+    # 如果接口是bond0，直接返回
+    if [ "$interface" = "$BOND_INTERFACE" ]; then
+        echo "$BOND_INTERFACE"
+        return
+    fi
     
     # 方法1: 使用ubus (OpenWrt标准方式)
     if command -v ubus >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1; then
@@ -196,6 +225,7 @@ get_current_logical_interface() {
     local current_device=$(get_current_default_interface)
     local wan_device=$(get_interface_device "$WAN_INTERFACE")
     local wwan_device=$(get_interface_device "$WWAN_INTERFACE")
+    local bond_device=$(get_interface_device "$BOND_INTERFACE")
     
     if [ -z "$current_device" ]; then
         echo "unknown"
@@ -206,13 +236,224 @@ get_current_logical_interface() {
         echo "$WAN_INTERFACE"
     elif [ "$current_device" = "$wwan_device" ]; then
         echo "$WWAN_INTERFACE"
+    elif [ "$current_device" = "$bond_device" ]; then
+        echo "$BOND_INTERFACE"
     else
         echo "unknown"
     fi
 }
 
+# 显示链路聚合状态
+show_bond_status() {
+    if ! is_bond_enabled; then
+        echo "链路聚合: 未启用"
+        return
+    fi
+    
+    echo "=== 链路聚合状态 ==="
+    echo "接口: $BOND_INTERFACE"
+    
+    # 显示bond0基本信息
+    if [ -f "/sys/class/net/$BOND_INTERFACE/bonding/mode" ]; then
+        local bond_mode=$(cat "/sys/class/net/$BOND_INTERFACE/bonding/mode")
+        echo "模式: $bond_mode"
+    fi
+    
+    if [ -f "/sys/class/net/$BOND_INTERFACE/bonding/mii_status" ]; then
+        local mii_status=$(cat "/sys/class/net/$BOND_INTERFACE/bonding/mii_status")
+        echo "MII状态: $mii_status"
+    fi
+    
+    # 显示从接口状态
+    echo -e "\n--- 从接口状态 ---"
+    if [ -f "/sys/class/net/$BOND_INTERFACE/bonding/slaves" ]; then
+        local slaves=$(cat "/sys/class/net/$BOND_INTERFACE/bonding/slaves")
+        echo "从接口: $slaves"
+        
+        for slave in $slaves; do
+            local slave_state="unknown"
+            if [ -f "/sys/class/net/$BOND_INTERFACE/bonding/slave_$slave/state" ]; then
+                slave_state=$(cat "/sys/class/net/$BOND_INTERFACE/bonding/slave_$slave/state" 2>/dev/null)
+            fi
+            local slave_link=$(ip link show "$slave" 2>/dev/null | grep -o "state [A-Z]*" | cut -d' ' -f2)
+            echo "  $slave: 状态=$slave_state, 链路=$slave_link"
+        done
+    fi
+    
+    # 显示bond0网络状态
+    echo -e "\n--- 网络状态 ---"
+    local bond_gateway=$(get_interface_gateway "$BOND_INTERFACE")
+    local bond_ip=$(ip addr show "$BOND_INTERFACE" 2>/dev/null | grep "inet " | awk '{print $2}')
+    echo "IP地址: $bond_ip"
+    echo "网关: $bond_gateway"
+    echo "基本状态: $(check_interface_basic "$BOND_INTERFACE" && echo '✓' || echo '✗')"
+    echo "网络连通: $(check_connectivity "$BOND_INTERFACE" && echo '✓' || echo '✗')"
+}
+
+# 创建链路聚合
+create_bond() {
+    if is_bond_enabled; then
+        log "链路聚合 $BOND_INTERFACE 已存在"
+        show_bond_status
+        return 0
+    fi
+    
+    log "开始创建链路聚合 $BOND_INTERFACE"
+    debug_interfaces
+    
+    # 获取WAN和WWAN的实际设备名
+    local wan_device=$(get_interface_device "$WAN_INTERFACE")
+    local wwan_device=$(get_interface_device "$WWAN_INTERFACE")
+    
+    log "WAN设备: $wan_device"
+    log "WWAN设备: $wwan_device"
+    
+    if [ -z "$wan_device" ] || [ -z "$wwan_device" ]; then
+        log "错误: 无法获取 WAN 或 WWAN 设备名"
+        return 1
+    fi
+    
+    if [ "$wan_device" = "$wwan_device" ]; then
+        log "错误: WAN 和 WWAN 使用相同设备，无法聚合"
+        return 1
+    fi
+    
+    log "聚合设备: $wan_device + $wwan_device -> $BOND_INTERFACE"
+    
+    # 检查设备是否存在
+    if ! ip link show "$wan_device" >/dev/null 2>&1; then
+        log "错误: 设备 $wan_device 不存在"
+        return 1
+    fi
+    
+    if ! ip link show "$wwan_device" >/dev/null 2>&1; then
+        log "错误: 设备 $wwan_device 不存在"
+        return 1
+    fi
+    
+    # 加载bonding模块
+    if ! lsmod | grep -q bonding; then
+        log "加载bonding模块..."
+        modprobe bonding
+        sleep 1
+    fi
+    
+    # 创建bond接口
+    log "创建bond接口 $BOND_INTERFACE..."
+    if ! ip link add "$BOND_INTERFACE" type bond mode "$BOND_MODE" miimon "$BOND_MIIMON"; then
+        log "错误: 创建bond接口失败"
+        return 1
+    fi
+    
+    # 设置fail_over_mac
+    if [ -f "/sys/class/net/$BOND_INTERFACE/bonding/fail_over_mac" ]; then
+        echo "$BOND_FAIL_OVER_MAC" > "/sys/class/net/$BOND_INTERFACE/bonding/fail_over_mac"
+    fi
+    
+    # 关闭原接口，避免地址冲突
+    log "关闭原接口并清理IP地址..."
+    ip link set "$wan_device" down
+    ip link set "$wwan_device" down
+    
+    # 移除原接口的IP地址
+    ip addr flush dev "$wan_device"
+    ip addr flush dev "$wwan_device"
+    
+    # 将接口加入bond
+    log "将接口加入bond..."
+    ip link set "$wan_device" master "$BOND_INTERFACE"
+    ip link set "$wwan_device" master "$BOND_INTERFACE"
+    
+    # 启用所有接口
+    log "启用所有接口..."
+    ip link set "$wan_device" up
+    ip link set "$wwan_device" up
+    ip link set "$BOND_INTERFACE" up
+    
+    # 使用DHCP获取地址
+    log "通过DHCP获取 $BOND_INTERFACE 地址..."
+    if command -v udhcpc >/dev/null 2>&1; then
+        udhcpc -i "$BOND_INTERFACE" -n -q -t 5 -T 3 >/dev/null 2>&1 &
+        local dhcp_pid=$!
+        sleep 3
+    else
+        log "警告: udhcpc 不可用，无法自动获取IP"
+    fi
+    
+    sleep 3
+    
+    # 验证bond状态
+    debug_interfaces
+    
+    if is_bond_enabled; then
+        log "✓ 链路聚合创建成功"
+        show_bond_status
+        return 0
+    else
+        log "✗ 链路聚合创建失败"
+        return 1
+    fi
+}
+
+# 删除链路聚合
+remove_bond() {
+    if ! is_bond_enabled; then
+        log "链路聚合 $BOND_INTERFACE 不存在"
+        return 0
+    fi
+    
+    log "开始删除链路聚合 $BOND_INTERFACE"
+    
+    # 获取从接口
+    local slaves=""
+    if [ -f "/sys/class/net/$BOND_INTERFACE/bonding/slaves" ]; then
+        slaves=$(cat "/sys/class/net/$BOND_INTERFACE/bonding/slaves")
+    fi
+    
+    log "从接口: $slaves"
+    
+    # 关闭bond接口
+    ip link set "$BOND_INTERFACE" down
+    
+    # 移除从接口
+    for slave in $slaves; do
+        ip link set "$slave" nomaster
+    done
+    
+    # 删除bond接口
+    ip link del "$BOND_INTERFACE"
+    
+    # 重新启用原接口
+    for slave in $slaves; do
+        ip link set "$slave" up
+        # 为原接口获取DHCP地址
+        if command -v udhcpc >/dev/null 2>&1; then
+            udhcpc -i "$slave" -n -q -t 5 -T 3 >/dev/null 2>&1 &
+        fi
+    done
+    
+    sleep 2
+    
+    debug_interfaces
+    
+    if ! is_bond_enabled; then
+        log "✓ 链路聚合删除成功"
+        return 0
+    else
+        log "✗ 链路聚合删除失败"
+        return 1
+    fi
+}
+
 # 核心自动切换逻辑
 auto_switch() {
+    # 检查链路聚合状态
+    if is_bond_enabled; then
+        log "检测到链路聚合已启用，跳过自动切换"
+        show_bond_status
+        return 0
+    fi
+    
     log "开始智能网络切换检查"
     
     local current_interface=$(get_current_logical_interface)
@@ -297,6 +538,13 @@ auto_switch() {
 manual_switch() {
     local target_interface="$1"
     
+    # 检查链路聚合状态
+    if is_bond_enabled; then
+        log "检测到链路聚合已启用，跳过手动切换"
+        show_bond_status
+        return 0
+    fi
+    
     if check_interface_basic "$target_interface" && check_connectivity "$target_interface"; then
         if perform_switch "$target_interface"; then
             echo "$target_interface" > "$STATE_FILE"
@@ -315,11 +563,19 @@ show_status() {
     echo "当前接口: $(get_current_logical_interface)"
     echo "当前设备: $(get_current_default_interface)"
     
+    # 显示链路聚合状态
+    if is_bond_enabled; then
+        show_bond_status
+        return
+    fi
+    
     for interface in "$WAN_INTERFACE" "$WWAN_INTERFACE"; do
         echo -e "\n--- $interface ---"
         local device=$(get_interface_device "$interface")
         local gateway=$(get_interface_gateway "$interface")
+        local ip_addr=$(ip addr show "$device" 2>/dev/null | grep "inet " | awk '{print $2}')
         echo "设备: $device"
+        echo "IP地址: $ip_addr"
         echo "网关: $gateway"
         echo "基本状态: $(check_interface_basic "$interface" && echo '✓' || echo '✗')"
         echo "网络连通: $(check_connectivity "$interface" && echo '✓' || echo '✗')"
@@ -328,8 +584,8 @@ show_status() {
 
 # 显示帮助
 show_help() {
-    echo "智能网络切换脚本"
-    echo "用法: $0 [auto|status|switch wan|switch wwan|test]"
+    echo "智能网络切换脚本 + 链路聚合"
+    echo "用法: $0 [auto|status|switch wan|switch wwan|test|bond|unbond|debug|help]"
     echo ""
     echo "命令:"
     echo "  auto        - 自动切换 (WAN优先)"
@@ -337,16 +593,38 @@ show_help() {
     echo "  switch wan  - 强制切换到WAN"
     echo "  switch wwan - 强制切换到WWAN"
     echo "  test        - 测试所有接口连通性"
+    echo "  bond        - 创建链路聚合 bond0"
+    echo "  unbond      - 删除链路聚合 bond0"
+    echo "  debug       - 显示调试信息"
     echo ""
     echo "配置:"
     echo "  WAN接口: $WAN_INTERFACE"
     echo "  WWAN接口: $WWAN_INTERFACE"
+    echo "  Bond接口: $BOND_INTERFACE (mode=$BOND_MODE, miimon=$BOND_MIIMON)"
     echo "  检测目标: $PING_TARGETS"
 }
 
 # 测试功能
 test_connectivity() {
     echo "=== 网络连通性测试 ==="
+    
+    # 显示链路聚合状态
+    if is_bond_enabled; then
+        show_bond_status
+        echo -e "\n测试 $BOND_INTERFACE:"
+        if check_interface_basic "$BOND_INTERFACE"; then
+            echo "✓ 基本状态正常"
+            if check_connectivity "$BOND_INTERFACE"; then
+                echo "✓ 网络连通正常"
+            else
+                echo "✗ 网络连通异常"
+            fi
+        else
+            echo "✗ 基本状态异常"
+        fi
+        return
+    fi
+    
     for interface in "$WAN_INTERFACE" "$WWAN_INTERFACE"; do
         echo -e "\n测试 $interface:"
         if check_interface_basic "$interface"; then
@@ -380,6 +658,15 @@ main() {
             ;;
         test)
             test_connectivity
+            ;;
+        bond)
+            create_bond
+            ;;
+        unbond)
+            remove_bond
+            ;;
+        debug)
+            debug_interfaces
             ;;
         help|--help|-h)
             show_help

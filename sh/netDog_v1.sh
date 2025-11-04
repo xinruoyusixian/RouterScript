@@ -130,14 +130,20 @@ check_connectivity() {
     
     # 对每个目标进行ping测试
     for target in $PING_TARGETS; do
-        log "测试 $interface($device) -> $target"
+        
         if ping -I "$device" -c "$PING_COUNT" -W "$PING_TIMEOUT" "$target" >/dev/null 2>&1; then
-            log "✓ $interface 通过 $target 检测正常"
+            log "✓ $interface ($device)通过 $target 检测正常"
             return 0
+        else
+            log "✓ $interface ($device)通过 $target 检测失败，尝试重启接口"
+            ifdown "$interface"
+            sleep 3
+            ifup set "$interface"
         fi
     done
     
-    log "✗ $interface 所有目标检测失败"
+    log "✗ $interface 所有目标检测失败,尝试重启接口"
+
     return 1
 }
 
@@ -153,7 +159,9 @@ check_interface_basic() {
     fi
     
     if [ -z "$gateway" ]; then
-        log "接口 $interface 没有网关"
+        ip link set "$device" up  #尝试启动一次设备
+        ifup "$interface"         #尝试启动一次接口
+        log "接口 $interface 没有网关,尝试重启一次"
         return 1
     fi
     

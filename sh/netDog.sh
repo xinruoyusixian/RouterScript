@@ -133,10 +133,10 @@ check_connectivity() {
     
     # 检查设备状态
     if ! ip link show "$device" 2>/dev/null | grep -q "state UP"; then
-        log "设备 $device 不是UP状态"
+        ip link set "$device" up  #尝试启动一次设备
+        log "设备 $device 不是UP状态,尝试UP一次"
         return 1
     fi
-    
     # 对每个目标进行ping测试
     for target in $PING_TARGETS; do
         if ping -I "$device" -c "$PING_COUNT" -W "$PING_TIMEOUT" "$target" >/dev/null 2>&1; then
@@ -146,7 +146,7 @@ check_connectivity() {
             log "✓ $interface ($device)通过 $target 检测失败，尝试重启接口"
             ifdown "$interface"
             sleep 3
-            ifup set "$interface"
+            ifup "$interface"
         fi
     done
     
@@ -154,31 +154,29 @@ check_connectivity() {
     return 1
 }
 
-# 检查接口基本状态
 check_interface_basic() {
-    local interface="$1"
+    local interface=$1
     local device=$(get_interface_device "$interface")
-    local gateway=$(get_interface_gateway "$interface")
-    
-    if [ -z "$device" ]; then
-    
-        log "接口 $interface 没有对应的网络设备"
+    local gateway
+
+    # 1. 设备名都没配
+    [ -z "$device" ] && \
+        { log "接口 $interface 没有对应的网络设备"; return 1; }
+
+    # 2. 设备根本不存在（被内核删掉或名字写错）
+    if ! ip link show "$device" &>/dev/null; then
+        log "设备 $device 不存在 "
         return 1
     fi
-    
+
+
+    # 4. 设备 UP 但没网关，再尝试一次 DHCP
+    gateway=$(get_interface_gateway "$interface")
     if [ -z "$gateway" ]; then
-        ip link set "$device" up  #尝试启动一次设备
-        ifup "$interface"         #尝试启动一次接口
-        log "接口 $interface 没有网关,尝试重启一次"
-        log "接口 $interface 没有网关"
+        log "接口 $interface 缺少网关"
         return 1
     fi
-    
-    if ! ip link show "$device" 2>/dev/null | grep -q "state UP"; then
-        log "设备 $device 不是UP状态"
-        return 1
-    fi
-    
+
     return 0
 }
 
@@ -348,13 +346,13 @@ show_status() {
 # 显示帮助
 show_help() {
     echo "智能网络切换脚本"
-    echo "用法: $0 [auto|status|switch-primary|switch-secondary|test]"
+    echo "用法: $0 [auto|status|main|backup|test]"
     echo ""
     echo "命令:"
     echo "  auto             - 自动切换 (主接口优先)"
     echo "  status           - 显示网络状态"
-    echo "  switch-primary   - 强制切换到主接口"
-    echo "  switch-secondary - 强制切换到备用接口"
+    echo "  main   - 强制切换到主接口"
+    echo "  backup - 强制切换到备用接口"
     echo "  test             - 测试所有接口连通性"
     echo ""
     echo "当前配置:"
@@ -378,7 +376,8 @@ test_connectivity() {
                 echo "✗ 网络连通异常"
             fi
         else
-            echo "✗ 基本状态异常"
+            echo "✗ 基本状态异常,尝试ifup一次 $interface"
+            ifup "$interface"
         fi
     done
 }
@@ -392,10 +391,10 @@ main() {
         status)
             show_status
             ;;
-        switch-primary)
+        main)
             manual_switch "$PRIMARY_INTERFACE"
             ;;
-        switch-secondary)
+        backup)
             manual_switch "$SECONDARY_INTERFACE"
             ;;
         test)

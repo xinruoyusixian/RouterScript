@@ -9,186 +9,220 @@
 # 3. 自动检测系统架构，支持手动指定
 # 4. 注释与说明写入 easytier.txt
 
+#!/bin/sh
 
-# 架构选择mipsel|mips|amd64|arm64|arm
-ARCH="mipsel"
-USERNAME=""
-PROXY_DEV="tun0"
-SCRIPT_PATH="$(
-  cd "$(dirname "$0")"
-  pwd
-)/$(basename "$0")"
+# EasyTier start script (idempotent)
+# Usage: sh easytier_start.sh <network-name> <network-secret>
+
+ARCH="${ARCH:-mipsel}"
+USERNAME="${HOSTNAME:-}"
+PROXY_DEV="${PROXY_DEV:-tun0}"
+VERSION="v2.3.2"
+
+SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
-#echo "脚本绝对路径: $SCRIPT_PATH"
-$echo "脚本所在目录: $SCRIPT_DIR"
+EASYTIER_DIR="./easytier"
+EASYTIER_TXT="$SCRIPT_DIR/easytier.txt"
+EASYTIER_BIN="$EASYTIER_DIR/easytier-core"
+EASYTIER_CLI_BIN="$EASYTIER_DIR/easytier-cli"
+PID_FILE="$EASYTIER_DIR/easytier-core.pid"
+LOG_TAG="[easytier]"
 
-# === 日志输出函数 ===
-LOG_TAG="【easytier】"
 log() {
-    logger -t "$LOG_TAG" "$1"
+    logger -t "$LOG_TAG" "$1" 2>/dev/null || echo "$1"
 }
 
-if [ $# -lt 2 ]; then
-    echo "用法: $0 <network-name> <network-secret> "
-    exit 1
-fi
+usage() {
+    echo "Usage: $0 <network-name> <network-secret>"
+}
 
+ensure_args() {
+    if [ $# -lt 2 ]; then
+        usage
+        exit 1
+    fi
+}
+
+zip_name_by_arch() {
+    case "$1" in
+        amd64) echo "easytier-linux-amd64-$VERSION.zip" ;;
+        arm64) echo "easytier-linux-arm64-$VERSION.zip" ;;
+        arm) echo "easytier-linux-arm-$VERSION.zip" ;;
+        mipsel) echo "easytier-linux-mipsel-$VERSION.zip" ;;
+        mips) echo "easytier-linux-mips-$VERSION.zip" ;;
+        *) echo "easytier-linux-$1-$VERSION.zip" ;;
+    esac
+}
+
+zip_dir_by_arch() {
+    case "$1" in
+        amd64) echo "easytier-linux-amd64" ;;
+        arm64) echo "easytier-linux-arm64" ;;
+        arm) echo "easytier-linux-arm" ;;
+        mipsel) echo "easytier-linux-mipsel" ;;
+        mips) echo "easytier-linux-mips" ;;
+        *) echo "easytier-linux-$1" ;;
+    esac
+}
+
+ensure_txt_exists() {
+    if [ -f "$EASYTIER_TXT" ]; then
+        return
+    fi
+
+    MACHINE_ID=$(cat /dev/urandom | tr -dc 'a-f0-9' | head -c32)
+    {
+        echo "machine_id:$MACHINE_ID"
+        echo "# Optional: proxy local subnet"
+        echo "#proxy:192.168.100.0/24"
+        echo "# One peer per line"
+        echo "node tcp://public.easytier.cn:11010"
+    } > "$EASYTIER_TXT"
+}
+
+read_machine_id() {
+    MACHINE_ID=$(grep '^machine_id:' "$EASYTIER_TXT" 2>/dev/null | head -n1 | sed 's/^machine_id://')
+    if [ -z "$MACHINE_ID" ]; then
+        MACHINE_ID=$(cat /dev/urandom | tr -dc 'a-f0-9' | head -c32)
+        echo "machine_id:$MACHINE_ID" >> "$EASYTIER_TXT"
+    fi
+}
+read_proxy_net() {
+    PROXY_NET=""
+    if [ -f "$EASYTIER_TXT" ]; then
+        PROXY_LINE=$(grep '^proxy:' "$EASYTIER_TXT" 2>/dev/null | head -n1)
+        if [ -n "$PROXY_LINE" ]; then
+            PROXY_NET=$(echo "$PROXY_LINE" | sed -e 's/^proxy://' -e 's/[[:space:]]*#.*$//' | tr -d ' ')
+        fi
+    fi
+}
+
+setup_forwarding_rules() {
+    echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+
+    if [ -n "$PROXY_NET" ]; then
+        /bin/iptables -C FORWARD -s "$PROXY_NET" -j ACCEPT 2>/dev/null || /bin/iptables -A FORWARD -s "$PROXY_NET" -j ACCEPT
+        /bin/iptables -C FORWARD -d "$PROXY_NET" -j ACCEPT 2>/dev/null || /bin/iptables -A FORWARD -d "$PROXY_NET" -j ACCEPT
+    fi
+
+    /bin/iptables -C INPUT -i "$PROXY_DEV" -j ACCEPT 2>/dev/null || /bin/iptables -A INPUT -i "$PROXY_DEV" -j ACCEPT
+    /bin/iptables -C FORWARD -i "$PROXY_DEV" -j ACCEPT 2>/dev/null || /bin/iptables -I FORWARD -i "$PROXY_DEV" -j ACCEPT
+    /bin/iptables -C FORWARD -o "$PROXY_DEV" -j ACCEPT 2>/dev/null || /bin/iptables -I FORWARD -o "$PROXY_DEV" -j ACCEPT
+    /bin/iptables -t nat -C POSTROUTING -o "$PROXY_DEV" -j MASQUERADE 2>/dev/null || /bin/iptables -t nat -I POSTROUTING -o "$PROXY_DEV" -j MASQUERADE
+}
+
+show_link_info() {
+    if [ ! -x "$EASYTIER_CLI_BIN" ]; then
+        return
+    fi
+
+    output=$($EASYTIER_CLI_BIN node 2>/dev/null)
+    [ -n "$output" ] && echo "$output"
+}
+
+get_running_pid() {
+    if [ -f "$PID_FILE" ]; then
+        PID_FROM_FILE=$(cat "$PID_FILE" 2>/dev/null)
+        if [ -n "$PID_FROM_FILE" ] && kill -0 "$PID_FROM_FILE" 2>/dev/null; then
+            echo "$PID_FROM_FILE"
+            return
+        fi
+    fi
+
+    PID_FROM_PIDOF=$(pidof easytier-core 2>/dev/null | awk '{print $1}')
+    if [ -n "$PID_FROM_PIDOF" ] && kill -0 "$PID_FROM_PIDOF" 2>/dev/null; then
+        echo "$PID_FROM_PIDOF"
+        return
+    fi
+
+    echo ""
+}
+
+ensure_binary() {
+    if [ -x "$EASYTIER_BIN" ] && [ -x "$EASYTIER_CLI_BIN" ]; then
+        return
+    fi
+
+    ZIP_NAME=$(zip_name_by_arch "$ARCH")
+    ZIP_DIR=$(zip_dir_by_arch "$ARCH")
+    ZIP_URL="https://ghfast.top/https://github.com/EasyTier/EasyTier/releases/download/$VERSION/$ZIP_NAME"
+
+    mkdir -p "$EASYTIER_DIR"
+    cd "$EASYTIER_DIR" || exit 1
+
+    log "Downloading $ZIP_URL"
+    wget -O "$ZIP_NAME" "$ZIP_URL" || {
+        log "Download failed: $ZIP_URL"
+        exit 1
+    }
+
+    unzip -o "$ZIP_NAME" || exit 1
+
+    if [ -d "$ZIP_DIR" ]; then
+        mv "$ZIP_DIR"/* ./
+        rmdir "$ZIP_DIR"
+    fi
+
+    chmod +x easytier-core 2>/dev/null || true
+    chmod +x easytier-cli 2>/dev/null || true
+
+    cd - >/dev/null 2>&1 || true
+}
+
+start_easytier() {
+    set -- "$EASYTIER_BIN" -d \
+        --network-name "$NETWORK_NAME" \
+        --network-secret "$NETWORK_SECRET" \
+        --hostname "$USERNAME" \
+        --machine-id "$MACHINE_ID"
+
+    if [ -f "$EASYTIER_TXT" ]; then
+        while IFS= read -r line; do
+            case "$line" in
+                ''|\#*)
+                    ;;
+                node\ *)
+                    NODE_URL=${line#node }
+                    [ -n "$NODE_URL" ] && set -- "$@" --peers "$NODE_URL"
+                    ;;
+            esac
+        done < "$EASYTIER_TXT"
+    fi
+
+    [ -n "$PROXY_NET" ] && set -- "$@" -n "$PROXY_NET"
+
+    "$@" &
+    NEW_PID=$!
+    echo "$NEW_PID" > "$PID_FILE"
+    log "easytier-core started, pid=$NEW_PID"
+}
+
+ensure_args "$@"
 NETWORK_NAME="$1"
 NETWORK_SECRET="$2"
-
 
 if [ -z "$USERNAME" ]; then
     USERNAME="$NETWORK_NAME"
 fi
 
-EASYTIER_DIR="/opt/app/easytier"
-EASYTIER_TXT="$SCRIPT_DIR/easytier.txt"
-echo $EASYTIER_TXT
+ensure_txt_exists
+read_machine_id
+read_proxy_net
+setup_forwarding_rules
 
-# 下载链接适配
-case "$ARCH" in
-    amd64)   ZIP_NAME="easytier-linux-amd64-v2.3.2.zip" ;;
-    arm64)   ZIP_NAME="easytier-linux-arm64-v2.3.2.zip" ;;
-    arm)     ZIP_NAME="easytier-linux-arm-v2.3.2.zip" ;;
-    mipsel)  ZIP_NAME="easytier-linux-mipsel-v2.3.2.zip" ;;
-    mips)    ZIP_NAME="easytier-linux-mips-v2.3.2.zip" ;;
-    *)       ZIP_NAME="easytier-linux-$ARCH-v2.3.2.zip" ;;
-esac
-ZIP_URL="https://ghfast.top/https://github.com/EasyTier/EasyTier/releases/download/v2.3.2/${ZIP_NAME}"
-
-case "$ARCH" in
-    amd64)   ZIP_DIR="easytier-linux-amd64" ;;
-    arm64)   ZIP_DIR="easytier-linux-arm64" ;;
-    arm)     ZIP_DIR="easytier-linux-arm" ;;
-    mipsel)  ZIP_DIR="easytier-linux-mipsel" ;;
-    mips)    ZIP_DIR="easytier-linux-mips" ;;
-    *)       ZIP_DIR="easytier-linux-$ARCH" ;;
-esac
-
-EASYTIER_BIN="$EASYTIER_DIR/easytier-core"
-EASYTIER_CLI_BIN="$EASYTIER_DIR/easytier-cli"
-# ---------- 生成/读取 machine_id，并初始化 easytier.txt 默认节点 ----------
-if [ ! -f "$EASYTIER_TXT" ]; then
-    MACHINE_ID=$(cat /dev/urandom | tr -dc 'a-f0-9' | head -c32)
-    {
-        echo "machine_id:$MACHINE_ID"
-        echo "#若需要代理本地网络，在下面添加（仅一行生效）:"
-        echo "#proxy:192.168.100.0/24 "
-        echo "# 可添加更多节点，每行一个，例如："
-        echo "node tcp://public.easytier.cn:11010"
-        
-
-    } > "$EASYTIER_TXT"
-fi
-
-# ---------- 读取 machine_id ----------
-MACHINE_ID=$(grep '^machine_id:' "$EASYTIER_TXT" | sed 's/^machine_id://')
-
-# ---------- 读取节点列表 ----------
-PEER_PARAMS=""
-if [ -f "$EASYTIER_TXT" ]; then
-    while IFS= read -r line; do
-        case "$line" in
-            node\ *)
-                NODE_URL=${line#node }
-                [ -n "$NODE_URL" ] && PEER_PARAMS="$PEER_PARAMS --peers \"$NODE_URL\""
-                ;;
-        esac
-    done < "$EASYTIER_TXT"
-fi
-
-# ---------- 检查并读取 proxy: 配置 ----------
-PROXY_NET=""
-if [ -f "$EASYTIER_TXT" ]; then
-    PROXY_LINE=$(grep '^proxy:' "$EASYTIER_TXT" | head -n1)
-    if [ -n "$PROXY_LINE" ]; then
-        # 去掉注释部分
-        PROXY_NET=$(echo "$PROXY_LINE" | sed -e 's/^proxy://' -e 's/[[:space:]]*#.*$//')
-        PROXY_NET=$(echo "$PROXY_NET" | tr -d ' ')
-    fi
-fi
-
-if [ -n "$PROXY_NET" ]; then
-    PROXY_PARAM="-n $PROXY_NET"
-else
-    PROXY_PARAM=""
-fi
-
-# ---------- Padavan方式开启网关转发 ----------
-echo 1 > /proc/sys/net/ipv4/ip_forward
-
-# ---------- 自动添加防火墙转发规则，避免重复 ----------
-if [ -n "$PROXY_NET" ]; then
-    /bin/iptables  -C FORWARD -s "$PROXY_NET" -j ACCEPT 2>/dev/null ||  /bin/iptables  -A FORWARD -s "$PROXY_NET" -j ACCEPT
-    /bin/iptables  -C FORWARD -d "$PROXY_NET" -j ACCEPT 2>/dev/null ||  /bin/iptables  -A FORWARD -d "$PROXY_NET" -j ACCEPT
-    log "已放行 $PROXY_NET 的FORWARD转发"
-fi
-
-/bin/iptables -C INPUT -i "$PROXY_DEV" -j ACCEPT 2>/dev/null    ||  /bin/iptables -A INPUT -i "$PROXY_DEV" -j ACCEPT
-# FORWARD -i
-/bin/iptables -C FORWARD -i "$PROXY_DEV" -j ACCEPT 2>/dev/null  ||  /bin/iptables -I FORWARD -i "$PROXY_DEV" -j ACCEPT
-# FORWARD -o
-/bin/iptables -C FORWARD -o "$PROXY_DEV" -j ACCEPT 2>/dev/null  ||  /bin/iptables -I FORWARD -o "$PROXY_DEV" -j ACCEPT
-# NAT MASQUERADE
-/bin/iptables -t nat -C POSTROUTING -o "$PROXY_DEV" -j MASQUERADE 2>/dev/null ||        /bin/iptables -t nat -I POSTROUTING -o "$PROXY_DEV" -j MASQUERADE
-
-
-link_info(){
-  # 获取 easytier-cli node 的输出
-  $EASYTIER_CLI_BIN node
-  output=$($EASYTIER_CLI_BIN node)
-  # 提取信息
-  VirtualIP=$(echo "$output" | awk -F'│' '/Virtual IP/ {gsub(/^[ \t]+|[ \t]+$/,"",$3); print $3}')
-  Hostname=$(echo "$output" | awk -F'│' '/Hostname/ {gsub(/^[ \t]+|[ \t]+$/,"",$3); print $3}')
-  PeerID=$(echo "$output" | awk -F'│' '/Peer ID/ {gsub(/^[ \t]+|[ \t]+$/,"",$3); print $3}')
-  
-  # 以 log 格式输出
-  echo $output
-  echo  "Virtual IP: $VirtualIP"
-  log "Virtual IP: $VirtualIP"
-  log "Hostname: $Hostname"
-  log "Peer ID: $PeerID"
-}
-
-# ---------- 检查服务是否已运行 ----------
-if pidof easytier-core > /dev/null 2>&1; then
-    log "EasyTier 服务已经运行。"
-    echo "EasyTier 服务已经运行。"
-    link_info
+RUNNING_PID=$(get_running_pid)
+if [ -n "$RUNNING_PID" ]; then
+    log "easytier-core is already running (pid=$RUNNING_PID), skip starting"
+    echo "easytier-core already running: pid=$RUNNING_PID"
+    show_link_info
     exit 0
 fi
 
-# ---------- 下载与解压 EasyTier ----------
-if [ ! -x "$EASYTIER_BIN" ]; then
-    mkdir -p "$EASYTIER_DIR"
-    cd "$EASYTIER_DIR"
-    log "正在下载 EasyTier 二进制文件: $ZIP_URL"
-    wget -O "$ZIP_NAME" "$ZIP_URL"
-    if [ $? -ne 0 ]; then
-        log "下载失败，请检查网络连接或下载地址。"
-        exit 1
-    fi
+ensure_binary
+start_easytier
+sleep 2
+show_link_info
 
-    log "正在解压到$ZIP_NAME..."
-    
-    unzip -o "$ZIP_NAME"
-    if [ -d "$ZIP_DIR" ]; then
-        mv "$ZIP_DIR"/* ./
-        log "移动$ZIP_DIR..."
-        rmdir "$ZIP_DIR"
-    fi
-    chmod +x easytier-core 2>/dev/null
-    chmod +x easytier-cli 2>/dev/null
-    cd - > /dev/null
-fi
+exit 0
 
-CMD="$EASYTIER_BIN -d --network-name \"$NETWORK_NAME\" --network-secret \"$NETWORK_SECRET\" --hostname \"$USERNAME\" --machine-id \"$MACHINE_ID\" $PEER_PARAMS $PROXY_PARAM &"
-
-echo $CMD
-log $CMD
-eval $CMD
-sleep 3
-link_info
-
-exit $?

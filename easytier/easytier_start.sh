@@ -1,14 +1,4 @@
 #!/bin/sh
-
-# EasyTier v16 全自动架构自适应启动脚本
-# 适用于 Padavan/OpenWrt/老毛子等，节点信息从 easytier.txt 读取。
-# 节点格式：node tcp://x.x.x.x:11010
-# 新增功能：
-# 1. 支持 proxy: 字段，自动加 -n <CIDR> 参数
-# 2. 自动为代理网段添加防火墙转发规则（Padavan风格，防止重复添加）
-# 3. 自动检测系统架构，支持手动指定
-# 4. 注释与说明写入 easytier.txt
-#!/bin/sh
 ############################################################
 # EasyTier Supervisor (Embedded Friendly Edition)
 # - Auto arch detect
